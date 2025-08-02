@@ -1,0 +1,29 @@
+{
+  "response": "Ok, moving forward 5 meters, right 3 meters, and turning left 100 degrees.",
+  "actions": [
+    {
+      "type": "move_forward",
+      "target": "",
+      "parameters": {
+        "distance": 5.0,
+        "speed": 1.0
+      }
+    },
+    {
+      "type": "move_right",
+      "target": "",
+      "parameters": {
+        "distance": 3,
+        "speed": 1.0
+      }
+    },
+    {
+      "type": "turn",
+      "target": "",
+      "parameters": {
+        "angle": 100,
+        "direction": "left"
+      }
+    }
+  ]
+}
