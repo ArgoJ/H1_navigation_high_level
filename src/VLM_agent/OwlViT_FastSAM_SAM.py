@@ -563,6 +563,7 @@ from ultralytics import YOLO
 import easyocr
 from transformers import MarianMTModel, MarianTokenizer
 import torch
+import os
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw
@@ -630,7 +631,7 @@ def prompt_match(tokens, ocr_tokens, fuzzy_th=0.8):
 # --------------------
 
 class SAMSegmenter:
-    def __init__(self, sam_ckpt="src\VLM_agent\sam_hq\sam_vit_h_4b8939.pth", device=None):
+    def __init__(self, sam_ckpt="src/VLM_agent/sam_hq/sam_vit_h_4b8939.pth", device=None):
         self.device ="cpu" # device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt).to(self.device)
         self.sam_predictor = SamPredictor(self.sam)
@@ -672,12 +673,28 @@ class SAMSegmenter:
         return masks                   
 
 class TextDrivenSegmenter:
-    def __init__(self, fastsam_model_path='src\VLM_agent\FastSAM\FastSAM-x.pt', use_gpu=True):
+    def __init__(self, fastsam_model_path='src/VLM_agent/FastSAM/FastSAM-x.pt', use_gpu=True):
+        """Wrapper that loads OwlViT + (Fast)SAM.
+
+        fastsam_model_path: Pfad zur FastSAM-x.pt. Falls nicht vorhanden wird versucht
+        sie relativ zum aktuellen Dateiordner unter FastSAM/FastSAM-x.pt zu finden.
+        """
+        import os
+        from pathlib import Path
+        # Robustere Pfadbehandlung (Backslashes aus Windows-String vermeiden)
+        fastsam_model_path = fastsam_model_path.replace('\\', '/')
+        if not os.path.isfile(fastsam_model_path):
+            alt = Path(__file__).parent / 'FastSAM' / 'FastSAM-x.pt'
+            if alt.is_file():
+                fastsam_model_path = str(alt)
+            else:
+                raise FileNotFoundError(
+                    f"FastSAM Gewichte nicht gefunden: '{fastsam_model_path}' oder '{alt}'. Bitte Datei ablegen.")
         self.owl_processor = OwlViTProcessor.from_pretrained("google/owlvit-large-patch14")
         self.owl_model     = OwlViTForObjectDetection.from_pretrained("google/owlvit-large-patch14")
         
         self.fastsam       = YOLO(fastsam_model_path)
-        self.sam = SAMSegmenter(sam_ckpt="src\VLM_agent\sam_hq\sam_vit_h_4b8939.pth")
+        self.sam = SAMSegmenter(sam_ckpt="src/VLM_agent/sam_hq/sam_vit_h_4b8939.pth")
         
         self.reader        = easyocr.Reader(['de'], gpu=use_gpu)
         self.device        = "cuda" if (use_gpu and torch.cuda.is_available()) else "cpu"
@@ -831,7 +848,8 @@ class TextDrivenSegmenter:
         return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
 def find_object_central_pixel(target: str, text: str, image_path, is_sam: bool = True, if_translate: bool = False):
-    seg = TextDrivenSegmenter(fastsam_model_path="src\VLM_agent\FastSAM\FastSAM-x.pt")
+    # Verwende forward slashes (Linux) und robuste Lade-Logik in TextDrivenSegmenter
+    seg = TextDrivenSegmenter(fastsam_model_path="src/VLM_agent/FastSAM/FastSAM-x.pt")
     img, boxes, points = seg.detect_and_segment(image_path, [target], [text],  multi_task = False, if_sam = is_sam, if_translate = if_translate)
     img.save("result.jpg")
     for (b,l,s),pt in zip(boxes, points):

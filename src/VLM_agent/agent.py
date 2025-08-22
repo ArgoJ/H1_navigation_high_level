@@ -10,7 +10,7 @@ def calibrate_points(points):
 
 
 
-def VLM_agent(user_prompt: str, image_path) -> list:
+def VLM_agent(user_prompt: str, image_path) -> tuple[bool, None | tuple[int, int]]:
     """
     启动 VLM Agent，处理视觉任务。
     """
@@ -36,8 +36,6 @@ def VLM_agent(user_prompt: str, image_path) -> list:
     print(f"🎯 Segmentation center point: {seg_center_point}")
     print(f"📊 Detection score: {score}")
 
-    world_point = calibrate_points(seg_center_point)
-
     print("✅ VLM Agent completed.")
 
-    return True, world_point  # 返回检测到的目标框和中心点坐标
+    return True, seg_center_point  # 返回检测到的目标框和中心点坐标

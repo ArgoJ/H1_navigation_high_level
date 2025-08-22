@@ -1,174 +1,214 @@
-import subprocess
-import json
 import time
-from src.VLM_agent.agent import VLM_agent  
-import socket, struct, time
+import rclpy
+import socket
+import time
+import threading
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-addr = ("127.0.0.1", 5555)
+from dataclasses import dataclass, field
+from enum import Enum 
+from copy import deepcopy
+from PIL import Image
+from geometry_msgs.msg import Pose, Point, Quaternion
 
-def call_ros2_service(service_name, service_type, args_dict):
-    """
-    调用 ROS 2 服务，通过 subprocess 调用 CLI，等待结果并返回是否成功。
-    """
-    arg_str = json.dumps(args_dict).replace('"', '\\"')
-    cmd = [
-        "ros2", "service", "call",
-        service_name,
-        service_type,
-        arg_str
-    ]
-    print(f"\n🚀 Calling service: {' '.join(cmd)}")
+try:
+    from src.execute.ros_communication import RosVlmNode
+    from src.execute.target_pose_finder import get_relative_target_pose_from_image, relative_to_map_pose
+except ImportError:
+    from ros_communication import RosVlmNode
+    from target_pose_finder import get_relative_target_pose_from_image, relative_to_map_pose
 
-    try:
-        result = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        print("✅ Service call returned:")
-        print(result)
+try:    
+    from src.VLM_agent.agent import VLM_agent
+except ImportError:
+    import sys
+    from pathlib import Path
+    sys.path.append(Path(__file__).parent.parent.parent.as_posix())
+    from src.VLM_agent.agent import VLM_agent
 
-        # 检查是否包含 success: True
-        if "success: true" in result.lower():
-            return True
+
+class Direction(Enum):
+    LEFT       = "left"
+    RIGHT      = "right"
+    FORWARD    = "forward"
+    BACKWARD   = "backward"
+
+
+@dataclass
+class PerceiveAction:
+    target: str    = "Default Target"
+
+@dataclass
+class StopAction:
+    duration: float = 1.0
+
+@dataclass
+class MoveAction:
+    speed: float                          = 0.5
+    distance: float                       = 0.0
+    direction: Direction                  = Direction.FORWARD
+    execution_time: float                 = field(init=False, repr=False)
+    udp_cmd: tuple[float, float, float]   = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.speed = abs(self.speed)
+        self.execution_time = self.distance / self.speed
+        match self.direction:
+            case Direction.FORWARD:
+                self.udp_cmd = (self.speed, 0.0, 0.0)
+            case Direction.BACKWARD:
+                self.udp_cmd = (-self.speed, 0.0, 0.0)
+            case Direction.LEFT:
+                self.udp_cmd = (0.0, self.speed, 0.0)
+            case Direction.RIGHT:
+                self.udp_cmd = (0.0, -self.speed, 0.0)
+            case _:
+                self.udp_cmd = (0.0, 0.0, 0.0)
+
+
+@dataclass
+class TurnAction:
+    speed: float                          = 0.5
+    angle: float                          = 0.0
+    direction: Direction                  = Direction.LEFT
+    execution_time: float                 = field(init=False, repr=False)
+    udp_cmd: tuple[float, float, float]   = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.angle = abs(self.angle)
+        angle_radians = self.angle / 180 * 3.14
+        self.execution_time = angle_radians / self.speed
+
+        if self.direction == Direction.LEFT:
+            self.udp_cmd = (0.0, 0.0, self.speed)
+        elif self.direction == Direction.RIGHT:
+            self.udp_cmd = (0.0, 0.0, -self.speed)
         else:
-            print("❌ Service reported failure.")
-            return False
-    except subprocess.CalledProcessError as e:
-        print("❌ Service call failed:")
-        print(e.output)
+            self.udp_cmd = (0.0, 0.0, 0.0)
+
+
+class ActionExecutor:
+    def __init__(self, address: str = "127.0.0.1", port: int = 5555, image_path: str = "images/example.jpg"):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addr = (address, port)
+        self.image_path = image_path
+        self.retry_count = 0
+
+        rclpy.init()
+        self.node = RosVlmNode()
+        self._spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
+        self._spin_thread.start()
+
+    def execute_sequence(self, actions: list[TurnAction | MoveAction | PerceiveAction | StopAction]) -> bool:
+        success = False
+        for action in actions:
+            print(f"Executing -> {action}")
+            match action:
+                case PerceiveAction():
+                    success = self.execute_preceive(action)
+                case MoveAction() | TurnAction():
+                    success = self.execute_move(action)
+                case StopAction():
+                    success = self.execute_stop(action)
+                case _:
+                    success = False
+
+            if not success:
+                print(f"Aborting action sequence due to failure at action {action}.")
+                return False
+        
+            time.sleep(0.5)
+        
+        print("Action sequence completed.")
+        return True
+
+    def execute_preceive(self, action: PerceiveAction, max_retries=6):
+        while True:
+            rgb, depth, cam_info, robot_pose = self.node.get_current_data()
+            
+            # Demo robot pose
+            # robot_pose = Pose(position=Point(x=0.0, y=1.0, z=1.0), orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0))
+
+            none_vals = [key for key, val in zip(
+                ["rgb", "depth", "cam_info", "robot_pose"], [rgb, depth, cam_info, robot_pose]) if val is None]
+
+            if not none_vals:
+                break
+            else:
+                print(f"Not all relevant data available: {none_vals}. Waiting...")
+                time.sleep(1)
+
+        rgb_im = Image.fromarray(rgb)
+        rgb_im.save(self.image_path)
+        
+        success, image_target_point = VLM_agent(action.target, image_path=self.image_path)
+
+        if success: 
+            rel_target_pose = get_relative_target_pose_from_image(image_target_point, rgb, depth, cam_info, window_size=10)
+            abs_target_pose = relative_to_map_pose(robot_pose, rel_target_pose)
+
+            print(f"Robot pose: {robot_pose}")
+            print(f"Relative target pose: {rel_target_pose}")
+            print(f"Absolute target pose: {abs_target_pose}")
+            self.node.publish_target_pose(abs_target_pose)
+            self.retry_count = 0
+
+            while self.node.get_path_execution_running():
+                time.sleep(1)
+            return True
+    
+        if self.retry_count < max_retries:
+            self.retry_count += 1
+            return self.execute_sequence([TurnAction(angle=60), action])
+
         return False
 
+    def execute_move(self, action: MoveAction | TurnAction) -> bool:
+        self.send_udp_cmd(*action.udp_cmd)
+        time.sleep(action.execution_time)
+        self.send_udp_cmd(0.04, 0.0, 0.0)
+        time.sleep(1)
+        return True
 
-def send(vx, vy, wz):
-    """把三个 float32 发送给仿真端"""
-    sock.sendto(struct.pack("fff", vx, vy, wz), addr)
+    def execute_stop(self, action: StopAction) -> bool:
+        self.send_udp_cmd(0.0, 0.0, 0.0)
+        time.sleep(action.duration)
+        return True
+
+    def send_udp_cmd(self, vx, vy, wz):
+        try:
+            message = f"{vx} {vy} {wz}"
+            data = message.encode('utf-8')
+            self.sock.sendto(data, self.addr)
+        except Exception as e:
+            print(f"Error sending UDP command: {e}")
+
+    def shutdown(self):
+        """Clean shutdown of ros spinners"""
+        try:
+            rclpy.shutdown()
+        except Exception as e:
+            print(f"Warning during rclpy.shutdown(): {e}")
+        try:
+            self._spin_thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.shutdown()
 
 
-def execute_action_sequence(actions):
-    """
-    串行执行动作序列，每一步等待其服务执行完且成功后才进行下一步。
-    """
-    target_point = None
-    angle = 0  # 初始化角度变量，后续可根据需要修改
-    distance = 0  # 初始化距离变量，后续可根据需要修改
-    direction = None  # 初始化方向变量，后续可根据需要修改
 
-    for i, action in enumerate(actions):
-        print(f"\n▶️ Executing action {i+1}/{len(actions)}: {action}")
-        act_type = action["type"]
-        if action["target"] is not None:
-            target = action["target"]
-        params = action.get("parameters", {})
-        if "distance" in params:
-            distance = params["distance"]
-        if "angle" in params:
-            angle = params["angle"]
-        if "direction" in params:
-            direction = params["direction"]
-        
-        
 
-        if act_type == "perceive":
-            print("execute perceive action")
-            success, world_point = VLM_agent(target, image_path="images/example.jpg")
-            target_point = world_point  # 获取目标的像素点坐标
-            time.sleep(5)
-            if success:
-                print(f"✅ Perceived target '{target}' at world coordinate point: {world_point}")
-            # success = call_ros2_service("/robot/perceive", "your_msgs/srv/Perceive", {"target": target})
-        elif act_type == "planning":
-            print(f"execute planning action, plan to move to '{target}', target location:", target_point)
-            time.sleep(5)
-            success = True
-            # success = call_ros2_service("/robot/planning", "your_msgs/srv/Planning", {"target": target})
-        elif act_type == "decision_making":
-            print("execute decision_making action")
-            time.sleep(5)
-            success = True
-            # success = call_ros2_service("/robot/decision_making", "your_msgs/srv/Decision", {"target": target})
-        elif act_type == "execution":
-            print("execute execution action")
-            time.sleep(5)
-            success = True
-            # success = call_ros2_service("/robot/execution", "your_msgs/srv/Sxecution", {"target": target})
-        elif act_type == "move_forward":
-            print("execute move_Forward action, distance:", distance)
-            t =  distance / 0.50  # 假设速度为 0.50 m/s
-            send(0.50, 0.00, 0.00)
-            time.sleep(t)
-            send(0.04, 0.00, 0.00)
-            time.sleep(1)  # 模拟执行时间
-            success = True
-            # success = call_ros2_service("/robot/forward", "your_msgs/srv/Forward", {"parameters": { "distance": distance })
-        elif act_type == "move_backward":
-            print("execute move_backward action, distance:", distance)
-            t =  distance / 0.50  # 假设速度为 0.50 m/s
-            send(-0.50, 0.00, 0.00)
-            time.sleep(t)
-            send(0.04, 0.00, 0.00)
-            time.sleep(1)  # 模拟执行时间
-            success = True
-            # success = call_ros2_service("/robot/backward", "your_msgs/srv/Backward", {"parameters": { "distance": distance })
-        elif act_type == "move_left":
-            print("execute move_left action, distance:", distance)
-            t =  distance / 0.50  # 假设速度为 0.50 m/s
-            send(0.00, 0.5, 0.00)
-            time.sleep(t)
-            send(0.04, 0.00, 0.00)
-            time.sleep(1)  # 模拟执行时间
-            success = True
-            # success = call_ros2_service("/robot/left", "your_msgs/srv/Left", {"parameters": { "distance": distance })            
-        elif act_type == "move_right":
-            print("execute move_right action, distance:", distance) 
-            t =  distance / 0.50  # 假设速度为 0.50 m/s
-            send(0.00, -0.5, 0.00)
-            time.sleep(t)
-            send(0.04, 0.00, 0.00)
-            time.sleep(1)  # 模拟执行时间
-            success = True
-            # success = call_ros2_service("/robot/right", "your_msgs/srv/Right", {"parameters": { "distance": distance })
-        elif act_type == "turn":
-            print("execute turning action, angle:", angle, "direction:", direction)
-            angle = angle / 180 * 3.14  # 将角度转换为弧度
-            t =  angle / 0.20  # 假设速度为 0.50 m/s
-            wy = 0.2 * (1 if direction == "left" else -1) 
-            send(0.00, 0.0, wy)
-            time.sleep(t)
-            send(0.04, 0.00, 0.00)
-            time.sleep(1)  # 模拟执行时间
-            success = True
-            # success = call_ros2_service("/robot/right", "your_msgs/srv/Right", {"parameters": { "angle": angle, "direction": direction }})
-        else:
-            print(f"⚠️ Unknown action type: {act_type}")
-            success = False
 
-        # 检查服务是否成功
-        if not success:
-            print(f"⛔ Aborting action sequence due to failure at step {i+1}.")
-            break
-
-        time.sleep(0.5)  # 可选延迟
-    
-    print("✅ Action sequence completed.")
-
-# ✅ 测试用例：手动构造动作序列
 if __name__ == "__main__":
     actions = [
-        {"type": "perceive", "target": "apple"},
-        {"type": "move", "target": "apple"},
-        {"type": "grasp", "target": "apple"},
-        {"type": "move", "target": "plate"},
-        {"type": "place", "target": "plate"},
-        {"type": "reset", "target": "home"}
+        PerceiveAction(target="plant"),
+        MoveAction(speed=0.5, distance=1.0, direction=Direction.FORWARD),
+        TurnAction(speed=0.2, angle=90.0, direction=Direction.LEFT),
+        StopAction(duration=1.0),
     ]
-
-    execute_action_sequence(actions)
-
-
-
-# # 举例 your_msgs/srv/Move.srv
-# string target
-# ---
-# bool success
-# string message
-
-# 服务端必须返回：
-# return Move.Response(success=True, message="Moved to apple.")
+    with ActionExecutor(image_path="images/rgb.jpg", port=12345) as action_exec:
+        action_exec.execute_sequence(actions)
