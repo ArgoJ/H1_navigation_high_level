@@ -25,15 +25,15 @@ class RosVlmNode(Node):
         self.camera_info_sub = self.create_subscription(
             CameraInfo, '/camera/info',
             self.camera_info_callback, 1)
-        # self.position_sub = self.create_subscription(
-        #     PoseStamped, '/pose',
-        #     self.position_callback, 1)
-        # self.quat_sub = self.create_subscription(
-        #     Quaternion, '/quat',
-        #     self.quat_callback, 1)
-        self.odom_sub = self.create_subscription(
-            Odometry, '/sim/odom',
-            self.odom_callback, 1)
+        self.position_sub = self.create_subscription(
+            PoseStamped, '/pose',
+            self.position_callback, 1)
+        self.quat_sub = self.create_subscription(
+            Quaternion, '/quat',
+            self.quat_callback, 1)
+        # self.odom_sub = self.create_subscription(
+        #     Odometry, '/sim/odom',
+        #     self.odom_callback, 1)
         self.trigger_sub = self.create_subscription(
             Bool, '/mpc/running',
             self.trigger_callback, 1)
@@ -118,17 +118,17 @@ class RosVlmNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error destroying camera_info_sub: {e}")
 
-    # def position_callback(self, msg: PoseStamped):
-    #     with self.data_lock:
-    #         self.pose.position = msg.pose.position
-
-    # def quat_callback(self, msg: Quaternion):
-    #     with self.data_lock:
-    #         self.pose.orientation = msg
-
-    def odom_callback(self, msg: Odometry):
+    def position_callback(self, msg: PoseStamped):
         with self.data_lock:
-            self.pose = msg.pose.pose
+            self.pose.position = msg.pose.position
+
+    def quat_callback(self, msg: Quaternion):
+        with self.data_lock:
+            self.pose.orientation = msg
+
+    # def odom_callback(self, msg: Odometry):
+    #     with self.data_lock:
+    #         self.pose = msg.pose.pose
 
     def trigger_callback(self, msg: Bool):
         with self.trigger_lock:
