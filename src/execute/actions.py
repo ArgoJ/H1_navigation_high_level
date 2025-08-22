@@ -4,13 +4,21 @@ import socket
 import time
 import threading
 import logging
+import numpy as np
+import cv2
 
 from dataclasses import dataclass, field
 from enum import Enum 
-from PIL import Image
 from geometry_msgs.msg import Point, Pose, Quaternion
+from sensor_msgs.msg import CameraInfo
 
-try:
+try:    
+    import sys
+    from pathlib import Path
+    sys.path.append(Path(__file__).parent.parent.parent.as_posix())
+    from src.VLM_agent.agent import VLM_agent
+    from src.logger import setup_logging
+
     from src.execute.ros_communication import RosVlmNode
     from src.execute.target_pose_finder import get_relative_target_pose_from_image, transform_relative_to_map
     from src.VLM_agent.agent import VLM_agent
@@ -84,11 +92,11 @@ class TurnAction:
 
 
 class ActionExecutor:
-    def __init__(self, address: str = "127.0.0.1", port: int = 5555, image_path: str = "images/example.jpg"):
+    def __init__(self, address: str = "127.0.0.1", port: int = 5555, image_path: str = "images/example.png"):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addr = (address, port)
         self.image_path = image_path
-        self.retry_count = 0
+        self.max_retries = 6
         self.logger = logging.getLogger('vln_humanoids')
 
         rclpy.init()
@@ -118,44 +126,21 @@ class ActionExecutor:
         self.logger.info("Action sequence completed.")
         return True
 
-    def execute_preceive(self, action: PerceiveAction, max_retries=6):
-        while True:
-            rgb, depth, cam_info, robot_pose = self.node.get_current_data()
-            
-            # Demo robot pose
-            robot_pose = Pose(position=Point(x=0.0, y=1.0, z=1.0), orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0))
+    def execute_preceive(self, action: PerceiveAction):
+        for _ in range(self.max_retries):
+            rgb, depth, cam_info, robot_pose = self._wait_for_data()
+            self._save_img(rgb)
+            self._safe_depth(depth)
+            success, image_target_point = VLM_agent(action.target, image_path=self.image_path)
 
-            none_vals = [key for key, val in zip(
-                ["rgb", "depth", "cam_info", "robot_pose"], [rgb, depth, cam_info, robot_pose]) if val is None]
+            if success: 
+                self._calc_and_publish_target_pose(image_target_point, depth, cam_info, robot_pose)
+                while self.node.get_path_execution_running():
+                    time.sleep(1)
+                return True
 
-            if not none_vals:
-                break
-            else:
-                self.logger.info(f"Not all relevant data available: {none_vals}. Waiting...")
-                time.sleep(1)
-
-        rgb_im = Image.fromarray(rgb)
-        rgb_im.save(self.image_path)
-        
-        success, image_target_point = VLM_agent(action.target, image_path=self.image_path)
-
-        if success: 
-            rel_target_position = get_relative_target_pose_from_image(image_target_point, rgb, depth, cam_info, window_size=10)
-            abs_target_pose = transform_relative_to_map(robot_pose, rel_target_position)
-
-            self.logger.debug(f"Robot pose: {robot_pose}")
-            self.logger.debug(f"Relative target pose: {rel_target_position}")
-            self.logger.debug(f"Absolute target pose: {abs_target_pose}")
-            self.node.publish_target_pose(abs_target_pose)
-            self.retry_count = 0
-
-            while self.node.get_path_execution_running():
-                time.sleep(1)
-            return True
-    
-        if self.retry_count < max_retries:
-            self.retry_count += 1
-            return self.execute_sequence([TurnAction(angle=60), action])
+            if not self.execute_move(TurnAction(angle=60)):
+                return False
 
         return False
 
@@ -190,6 +175,58 @@ class ActionExecutor:
         except Exception:
             pass
 
+    def _wait_for_data(self) -> tuple[np.ndarray, np.ndarray, CameraInfo, Pose]:
+        while True:
+            rgb, depth, cam_info, robot_pose = self.node.get_current_data()
+            none_vals = [key for key, val in zip(
+                ["rgb", "depth", "cam_info", "robot_pose"], [rgb, depth, cam_info, robot_pose]) if val is None]
+            if none_vals:
+                self.logger.info(f"Not all data available. Nones are {none_vals}. Waiting...")
+                time.sleep(1)
+            else:
+                return rgb, depth, cam_info, robot_pose
+
+    def _calc_and_publish_target_pose(self, image_target_point, depth, cam_info, robot_pose) -> bool:
+        rel_target_position = get_relative_target_pose_from_image(image_target_point, depth, cam_info, window_size=10)
+        abs_target_pose = transform_relative_to_map(robot_pose, rel_target_position)
+        self.logger.debug(f"Robot pose: {robot_pose}")
+        self.logger.debug(f"Relative target pose: {rel_target_position}")
+        self.logger.debug(f"Absolute target pose: {abs_target_pose}")
+        self.node.publish_target_pose(abs_target_pose)
+        return True
+
+    def _save_img(self, rgb):
+        if rgb is None:
+            return
+        img = rgb
+        if np.issubdtype(img.dtype, np.floating):
+            img = np.clip(img, 0.0, 1.0)
+            img = (img * 255).astype(np.uint8)
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        if img.shape[2] == 4:
+            img = img[..., :3]
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(self.image_path, bgr)
+
+    def _safe_depth(self, depth):
+        depth_base = self.image_path.replace("rgb", "depth").replace(".png", "")
+        if depth is None:
+            return
+        np.save(depth_base + ".npy", depth)
+        depth_clean = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        depth_mm = (depth_clean * 1000.0).astype(np.uint16)  # assumes depth in meters
+        cv2.imwrite(depth_base + ".png", depth_mm)           # 16-bit png
+        # visualization
+        v = depth_mm.copy()
+        v[v == 0] = 65535
+        vmin = v.min() if v.size else 0
+        vmax = v.max() if v.size else 1
+        if vmin == vmax: vmax = vmin + 1
+        vis = ((v.astype(np.float32) - vmin) / (vmax - vmin) * 255.0).astype(np.uint8)
+        vis_col = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
+        cv2.imwrite(depth_base + "_vis.png", vis_col)
+
     def __enter__(self):
         return self
 
@@ -206,7 +243,6 @@ def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction 
 
     params = action_dict.get("parameters", {})
 
-    # Mapping von String-Richtungen zur Direction-Enumeration
     direction_map = {
         "forward": Direction.FORWARD,
         "backward": Direction.BACKWARD,
@@ -237,7 +273,6 @@ def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction 
 
     if main_action == "turn":
         direction = direction_map.get(direction_str)
-        # Turn erlaubt nur LEFT oder RIGHT
         if direction not in [Direction.LEFT, Direction.RIGHT]:
             print(f"Unknown direction for 'turn': {direction_str}")
             return None
@@ -253,19 +288,13 @@ def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction 
 
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.append(Path(__file__).parent.parent.parent.as_posix())
-    from src.VLM_agent.agent import VLM_agent
-    from src.logger import setup_logging
-
     setup_logging(level=logging.DEBUG, package_name='vln_humanoids')
     logger = logging.getLogger('vln_humanoids')
     actions = [
         PerceiveAction(target="plant"),
-        MoveAction(speed=0.5, distance=1.0, direction=Direction.FORWARD),
-        TurnAction(speed=0.2, angle=90.0, direction=Direction.LEFT),
+        # MoveAction(speed=0.5, distance=1.0, direction=Direction.FORWARD),
+        # TurnAction(speed=0.2, angle=90.0, direction=Direction.LEFT),
         StopAction(duration=1.0),
     ]
-    with ActionExecutor(image_path="images/rgb.jpg", port=12345) as action_exec:
+    with ActionExecutor(image_path="images/rgb.png", port=12345) as action_exec:
         action_exec.execute_sequence(actions)

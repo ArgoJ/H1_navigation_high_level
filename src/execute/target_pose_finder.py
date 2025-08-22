@@ -9,18 +9,11 @@ logger = logging.getLogger(__name__)
 
 def get_relative_target_pose_from_image(
         pixel_position: tuple[int, int],
-        rgb: np.ndarray, 
         depth: np.ndarray, 
         cam_info: CameraInfo,
         window_size: int = 10,
         depth_scale: float | None = None
 ) -> Point | None:
-    if rgb is None or depth is None:
-        logger.warning("RGB or depth image is None.")
-        return None
-
-    if rgb.shape[:2] != depth.shape[:2]:
-        raise ValueError("RGB and depth images must have the same dimensions.")
     
     if depth_scale is None:
         if depth.dtype == np.uint16:
@@ -43,7 +36,10 @@ def get_relative_target_pose_from_image(
         return None
 
     mean_raw = float(np.mean(window[valid_mask]))
-    z = mean_raw * float(depth_scale)
+
+    print(window)
+    print(mean_raw)
+    z = mean_raw * float(depth_scale) # direction forward
     K = cam_info.k
     fx, fy = K[0], K[4]
     cx, cy = K[2], K[5]
@@ -52,9 +48,10 @@ def get_relative_target_pose_from_image(
         logger.warning("Camera intrinsic parameters fx or fy are zero, cannot compute relative position.")
         return None
 
-    X = (x - cx) * z / fx
-    Y = (y - cy) * z / fy
-    return Point(x=X, y=Y, z=z)
+    X = (x - cx) * z / fx # direction right
+    Y = (y - cy) * z / fy # direction down
+
+    return Point(x=z, y=-X, z=-Y)
 
 
 def transform_relative_to_map(robot_pose: Pose, relative_point: Point) -> Pose:
