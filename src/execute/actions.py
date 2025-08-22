@@ -3,27 +3,22 @@ import rclpy
 import socket
 import time
 import threading
+import logging
 
 from dataclasses import dataclass, field
 from enum import Enum 
-from copy import deepcopy
 from PIL import Image
-from geometry_msgs.msg import Pose, Point, Quaternion
+from geometry_msgs.msg import Point, Pose, Quaternion
 
 try:
     from src.execute.ros_communication import RosVlmNode
-    from src.execute.target_pose_finder import get_relative_target_pose_from_image, relative_to_map_pose
+    from src.execute.target_pose_finder import get_relative_target_pose_from_image, transform_relative_to_map
+    from src.VLM_agent.agent import VLM_agent
+    logger = logging.getLogger(__name__)
 except ImportError:
     from ros_communication import RosVlmNode
-    from target_pose_finder import get_relative_target_pose_from_image, relative_to_map_pose
+    from target_pose_finder import get_relative_target_pose_from_image, transform_relative_to_map
 
-try:    
-    from src.VLM_agent.agent import VLM_agent
-except ImportError:
-    import sys
-    from pathlib import Path
-    sys.path.append(Path(__file__).parent.parent.parent.as_posix())
-    from src.VLM_agent.agent import VLM_agent
 
 
 class Direction(Enum):
@@ -37,9 +32,11 @@ class Direction(Enum):
 class PerceiveAction:
     target: str    = "Default Target"
 
+
 @dataclass
 class StopAction:
     duration: float = 1.0
+
 
 @dataclass
 class MoveAction:
@@ -92,6 +89,7 @@ class ActionExecutor:
         self.addr = (address, port)
         self.image_path = image_path
         self.retry_count = 0
+        self.logger = logging.getLogger('vln_humanoids')
 
         rclpy.init()
         self.node = RosVlmNode()
@@ -101,7 +99,7 @@ class ActionExecutor:
     def execute_sequence(self, actions: list[TurnAction | MoveAction | PerceiveAction | StopAction]) -> bool:
         success = False
         for action in actions:
-            print(f"Executing -> {action}")
+            self.logger.info(f"Executing -> {action}")
             match action:
                 case PerceiveAction():
                     success = self.execute_preceive(action)
@@ -113,12 +111,11 @@ class ActionExecutor:
                     success = False
 
             if not success:
-                print(f"Aborting action sequence due to failure at action {action}.")
+                self.logger.warning(f"Aborting action sequence due to failure at action {action}.")
                 return False
         
             time.sleep(0.5)
-        
-        print("Action sequence completed.")
+        self.logger.info("Action sequence completed.")
         return True
 
     def execute_preceive(self, action: PerceiveAction, max_retries=6):
@@ -126,7 +123,7 @@ class ActionExecutor:
             rgb, depth, cam_info, robot_pose = self.node.get_current_data()
             
             # Demo robot pose
-            # robot_pose = Pose(position=Point(x=0.0, y=1.0, z=1.0), orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0))
+            robot_pose = Pose(position=Point(x=0.0, y=1.0, z=1.0), orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0))
 
             none_vals = [key for key, val in zip(
                 ["rgb", "depth", "cam_info", "robot_pose"], [rgb, depth, cam_info, robot_pose]) if val is None]
@@ -134,7 +131,7 @@ class ActionExecutor:
             if not none_vals:
                 break
             else:
-                print(f"Not all relevant data available: {none_vals}. Waiting...")
+                self.logger.info(f"Not all relevant data available: {none_vals}. Waiting...")
                 time.sleep(1)
 
         rgb_im = Image.fromarray(rgb)
@@ -143,12 +140,12 @@ class ActionExecutor:
         success, image_target_point = VLM_agent(action.target, image_path=self.image_path)
 
         if success: 
-            rel_target_pose = get_relative_target_pose_from_image(image_target_point, rgb, depth, cam_info, window_size=10)
-            abs_target_pose = relative_to_map_pose(robot_pose, rel_target_pose)
+            rel_target_position = get_relative_target_pose_from_image(image_target_point, rgb, depth, cam_info, window_size=10)
+            abs_target_pose = transform_relative_to_map(robot_pose, rel_target_position)
 
-            print(f"Robot pose: {robot_pose}")
-            print(f"Relative target pose: {rel_target_pose}")
-            print(f"Absolute target pose: {abs_target_pose}")
+            self.logger.debug(f"Robot pose: {robot_pose}")
+            self.logger.debug(f"Relative target pose: {rel_target_position}")
+            self.logger.debug(f"Absolute target pose: {abs_target_pose}")
             self.node.publish_target_pose(abs_target_pose)
             self.retry_count = 0
 
@@ -180,14 +177,14 @@ class ActionExecutor:
             data = message.encode('utf-8')
             self.sock.sendto(data, self.addr)
         except Exception as e:
-            print(f"Error sending UDP command: {e}")
+            self.logger.error(f"Error sending UDP command: {e}")
 
     def shutdown(self):
         """Clean shutdown of ros spinners"""
         try:
             rclpy.shutdown()
         except Exception as e:
-            print(f"Warning during rclpy.shutdown(): {e}")
+            self.logger.warning(f"Error during rclpy.shutdown(): {e}")
         try:
             self._spin_thread.join(timeout=1.0)
         except Exception:
@@ -200,10 +197,70 @@ class ActionExecutor:
         self.shutdown()
 
 
+def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction | StopAction | None:
+    """Parse a dictionary to an ActionClass object."""
+    action_type = action_dict.get("type")
+    if not action_type:
+        logger.error("'type' missing in action dictionary.")
+        return None
 
+    params = action_dict.get("parameters", {})
+
+    # Mapping von String-Richtungen zur Direction-Enumeration
+    direction_map = {
+        "forward": Direction.FORWARD,
+        "backward": Direction.BACKWARD,
+        "left": Direction.LEFT,
+        "right": Direction.RIGHT,
+    }
+    parts = action_type.split('_', 1)
+    main_action = parts[0]
+    direction_str = parts[1] if len(parts) > 1 else None
+    
+    if main_action == "perceive":
+        return PerceiveAction(target=action_dict.get("target", "Default Target"))
+    
+    if main_action == "stop":
+        return StopAction(duration=params.get("duration", 1.0))
+
+    if main_action == "move":
+        direction = direction_map.get(direction_str)
+        if direction is None:
+            print(f"Unknown direction for 'move': {direction_str}")
+            return None
+        
+        return MoveAction(
+            speed=params.get("speed", 0.5),
+            distance=params.get("distance", 0.0),
+            direction=direction
+        )
+
+    if main_action == "turn":
+        direction = direction_map.get(direction_str)
+        # Turn erlaubt nur LEFT oder RIGHT
+        if direction not in [Direction.LEFT, Direction.RIGHT]:
+            print(f"Unknown direction for 'turn': {direction_str}")
+            return None
+            
+        return TurnAction(
+            speed=params.get("speed", 0.5),
+            angle=params.get("angle", 0.0),
+            direction=direction
+        )
+
+    print(f"Unknown action type: {action_type}")
+    return None
 
 
 if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+    sys.path.append(Path(__file__).parent.parent.parent.as_posix())
+    from src.VLM_agent.agent import VLM_agent
+    from src.logger import setup_logging
+
+    setup_logging(level=logging.DEBUG, package_name='vln_humanoids')
+    logger = logging.getLogger('vln_humanoids')
     actions = [
         PerceiveAction(target="plant"),
         MoveAction(speed=0.5, distance=1.0, direction=Direction.FORWARD),

@@ -1,7 +1,10 @@
 import numpy as np
+import logging
 
 from geometry_msgs.msg import Pose, Quaternion, Point
 from sensor_msgs.msg import CameraInfo
+
+logger = logging.getLogger(__name__)
 
 
 def get_relative_target_pose_from_image(
@@ -13,6 +16,7 @@ def get_relative_target_pose_from_image(
         depth_scale: float | None = None
 ) -> Point | None:
     if rgb is None or depth is None:
+        logger.warning("RGB or depth image is None.")
         return None
 
     if rgb.shape[:2] != depth.shape[:2]:
@@ -45,6 +49,7 @@ def get_relative_target_pose_from_image(
     cx, cy = K[2], K[5]
 
     if fy == 0 or fx == 0:
+        logger.warning("Camera intrinsic parameters fx or fy are zero, cannot compute relative position.")
         return None
 
     X = (x - cx) * z / fx
@@ -54,7 +59,7 @@ def get_relative_target_pose_from_image(
 
 def transform_relative_to_map(robot_pose: Pose, relative_point: Point) -> Pose:
     if robot_pose is None or relative_point is None:
-        print("Robot Pose or Relative Point is None.")
+        logger.warning("Robot Pose or Relative Point is None.")
         return None
 
     robot_pos = np.array([robot_pose.position.x, robot_pose.position.y, robot_pose.position.z])
@@ -73,15 +78,3 @@ def transform_relative_to_map(robot_pose: Pose, relative_point: Point) -> Pose:
     )
     
     return absolute_target_pose
-
-
-if __name__ == "__main__":
-    # Example usage
-    rgb_image = np.zeros((480, 640, 3), dtype=np.uint8)
-    depth_image = np.zeros((480, 640), dtype=np.float32)
-    pixel_coords = (640, 480)
-
-    caminfo = CameraInfo()
-
-    target_pose = get_relative_target_pose_from_image(pixel_coords, rgb_image, depth_image, caminfo)
-    print("Estimated target pose:", target_pose)

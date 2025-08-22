@@ -31,7 +31,7 @@ class RosVlmNode(Node):
             Quaternion, '/quat',
             self.quat_callback, 1)
         self.trigger_sub = self.create_subscription(
-            Bool, '/mpc/flag',
+            Bool, '/mpc/running',
             self.trigger_callback, 1)
         
         # Thread-safe storage for received data
