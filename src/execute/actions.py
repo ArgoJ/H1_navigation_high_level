@@ -26,6 +26,7 @@ try:
 except ImportError:
     from ros_communication import RosVlmNode
     from target_pose_finder import get_relative_target_pose_from_image, transform_relative_to_map
+    
 
 
 
@@ -234,7 +235,7 @@ class ActionExecutor:
         self.shutdown()
 
 
-def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction | StopAction | None:
+def _parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction | StopAction | None:
     """Parse a dictionary to an ActionClass object."""
     action_type = action_dict.get("type")
     if not action_type:
@@ -251,7 +252,6 @@ def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction 
     }
     parts = action_type.split('_', 1)
     main_action = parts[0]
-    direction_str = parts[1] if len(parts) > 1 else None
     
     if main_action == "perceive":
         return PerceiveAction(target=action_dict.get("target", "Default Target"))
@@ -260,6 +260,7 @@ def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction 
         return StopAction(duration=params.get("duration", 1.0))
 
     if main_action == "move":
+        direction_str = parts[1] if len(parts) > 1 else None
         direction = direction_map.get(direction_str)
         if direction is None:
             print(f"Unknown direction for 'move': {direction_str}")
@@ -272,6 +273,7 @@ def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction 
         )
 
     if main_action == "turn":
+        direction_str = params.get("direction")
         direction = direction_map.get(direction_str)
         if direction not in [Direction.LEFT, Direction.RIGHT]:
             print(f"Unknown direction for 'turn': {direction_str}")
@@ -287,14 +289,23 @@ def parse_action(action_dict: dict) -> PerceiveAction | MoveAction | TurnAction 
     return None
 
 
+def parse_actions(actions_dict_list: list[dict]) -> list[PerceiveAction | MoveAction | TurnAction | StopAction]:
+    return [_parse_action(action) for action in actions_dict_list]
+
+
 if __name__ == "__main__":
+    from src.logger import setup_logging
     setup_logging(level=logging.DEBUG, package_name='vln_humanoids')
     logger = logging.getLogger('vln_humanoids')
-    actions = [
-        PerceiveAction(target="plant"),
-        # MoveAction(speed=0.5, distance=1.0, direction=Direction.FORWARD),
-        # TurnAction(speed=0.2, angle=90.0, direction=Direction.LEFT),
-        StopAction(duration=1.0),
+
+    actions_dict = [
+        { "type": "perceive", "target": "plant", "parameters": {} },
+        { "type": "turn", "parameters": { "angle": 90, "direction": "left" } },
+        { "type": "move_backward", "target": "", "parameters": { "distance": 1 } },
+        { "type": "move_right", "parameters": { "distance": 0.5 } },
+        { "type": "stop", "target": "TV", "parameters": {} },
     ]
+
+    actions = parse_actions(actions_dict)
     with ActionExecutor(image_path="images/rgb.png", port=12345) as action_exec:
         action_exec.execute_sequence(actions)

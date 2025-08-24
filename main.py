@@ -6,7 +6,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 from transcribe.stt import run_stt, NEW_TEXT_EVENT
 from transcribe.tts import run_tts
 from mistral_ai.llm import run_mistral_llm
-from execute.actions import execute_action_sequence
+from execute.actions import ActionExecutor, parse_actions
 TRANS_FILE = "src/transcribe/transcription.txt"
 VLM_FILE = "src/mistral_ai/scripts/vlm_script.txt"
 VLM_JSON_FILE = "src/mistral_ai/scripts/vlm_script.json"
@@ -58,10 +58,12 @@ if __name__ == "__main__":
         try:
             with open(LLM_JSON_FILE, "r", encoding="utf-8") as f:
                 llm_data = json.load(f)
-                actions = llm_data.get("actions", [])
+                action_dicts = llm_data.get("actions", [])
+                actions = parse_actions(action_dicts)
                 if actions:
                     print(f"🦾 Executing {len(actions)} actions...")
-                    execute_action_sequence(actions)
+                    with ActionExecutor() as action_exec:
+                        action_exec.execute_sequence(actions)
                 else:
                     print("ℹ️ No actions to execute.")
         except Exception as e:
