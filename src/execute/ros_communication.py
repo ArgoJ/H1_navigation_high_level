@@ -31,9 +31,6 @@ class RosVlmNode(Node):
         self.quat_sub = self.create_subscription(
             Quaternion, '/quat',
             self.quat_callback, 1)
-        # self.odom_sub = self.create_subscription(
-        #     Odometry, '/sim/odom',
-        #     self.odom_callback, 1)
         self.trigger_sub = self.create_subscription(
             Bool, '/mpc/running',
             self.trigger_callback, 1)
@@ -42,7 +39,8 @@ class RosVlmNode(Node):
         self.rgb = None
         self.depth = None
         self.camera_info = None
-        self.pose = None
+        self.position = None
+        self.orientation = None
         self.mpc_running = False
 
         self.data_lock = threading.Lock()
@@ -120,15 +118,11 @@ class RosVlmNode(Node):
 
     def position_callback(self, msg: PoseStamped):
         with self.data_lock:
-            self.pose.position = msg.pose.position
+            self.position = msg.pose.position
 
     def quat_callback(self, msg: Quaternion):
         with self.data_lock:
-            self.pose.orientation = msg
-
-    # def odom_callback(self, msg: Odometry):
-    #     with self.data_lock:
-    #         self.pose = msg.pose.pose
+            self.orientation = msg
 
     def trigger_callback(self, msg: Bool):
         with self.trigger_lock:
@@ -142,10 +136,11 @@ class RosVlmNode(Node):
         self.target_pub.publish(pose_stamped)
         self.get_logger().info(f"Published target position: {pose.position} and quat {pose.orientation}")
 
-    def get_current_data(self) -> tuple[np.ndarray, np.ndarray, CameraInfo, Pose]:
+    def get_current_data(self) -> None | tuple[np.ndarray, np.ndarray, CameraInfo, Pose]:
         """Thread-safe getter for current RGB and depth images"""
         with self.data_lock:
-            return self.rgb, self.depth, self.camera_info, self.pose
+            pose = Pose(position=self.position, orientation=self.orientation) if self.position is not None and self.orientation is not None else None
+            return self.rgb, self.depth, self.camera_info, pose
 
     def get_path_execution_running(self):
         """Thread-safe getter for MPC running state"""
